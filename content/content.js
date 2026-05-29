@@ -125,7 +125,8 @@ const speakerOffSvg = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M16
 const isPolileoPage = new URL(window.location.href).searchParams.has('polileo');
 
 // Check if there's still a chance for pole (only 1 post = OP only)
-const initialPostCount = countPostsInDOM();
+const initialThreadId = getThreadId();
+const initialPostCount = initialThreadId ? countPostsInDOM() : 0;
 const hasNoPoleYet = initialPostCount === 1;
 
 console.log('Polileo: Page load check - isPolileoPage:', isPolileoPage, 'posts:', initialPostCount, 'hasNoPoleYet:', hasNoPoleYet);
@@ -579,6 +580,155 @@ function updateButtonPosition() {
 updateButtonPosition();
 window.addEventListener('resize', updateButtonPosition);
 
+// Forum list fallback: parse the visible DOM on forumdisplay.php. This covers
+// cases where the background fetch receives a reduced/different HTML response.
+let forumDisplayScanTimer = null;
+let lastForumDisplayStatsLog = 0;
+const forumDisplayReportedPoleIds = new Set();
+
+function isForumDisplayListPage() {
+  const url = new URL(window.location.href);
+  return url.pathname.endsWith('/foro/forumdisplay.php') && url.searchParams.get('f') === '2';
+}
+
+function parseForumCount(text) {
+  const digits = String(text || '').replace(/[^\d]/g, '');
+  return digits === '' ? null : Number(digits);
+}
+
+function getThreadIdFromForumHref(href) {
+  try {
+    const url = new URL(href, window.location.href);
+    if (!url.pathname.includes('showthread.php')) return null;
+    return url.searchParams.get('t') || null;
+  } catch {
+    const match = String(href || '').match(/[?&]t=(\d+)/);
+    return match ? match[1] : null;
+  }
+}
+
+function getWhopostedThreadId(href) {
+  try {
+    const url = new URL(href, window.location.href);
+    if (!url.pathname.includes('misc.php') || url.searchParams.get('do') !== 'whoposted') return null;
+    return url.searchParams.get('t') || null;
+  } catch {
+    const raw = String(href || '');
+    if (!raw.includes('whoposted')) return null;
+    const match = raw.match(/[?&]t=(\d+)/);
+    return match ? match[1] : null;
+  }
+}
+
+function findForumThreadContainer(titleLink, threadId) {
+  for (let el = titleLink.parentElement; el && el !== document.body; el = el.parentElement) {
+    const counters = el.querySelectorAll('a[href*="whoposted"]');
+    for (const counter of counters) {
+      if (getWhopostedThreadId(counter.getAttribute('href')) === threadId) {
+        return el;
+      }
+    }
+  }
+  return titleLink.parentElement;
+}
+
+function isClosedForumDisplayThread(titleLink, threadId) {
+  const container = findForumThreadContainer(titleLink, threadId);
+  return !!container && container.outerHTML.includes('tema-closed');
+}
+
+function collectForumDisplayPolesFromDOM() {
+  const titles = new Map();
+  const counters = new Map();
+
+  document.querySelectorAll('a[id^="thread_title_"]').forEach((link) => {
+    const idMatch = link.id.match(/^thread_title_(\d+)$/);
+    if (!idMatch) return;
+
+    const id = idMatch[1];
+    const text = (link.textContent || '').replace(/\s+/g, ' ').trim();
+    const title = text || (link.getAttribute('title') || '').replace(/\s+/g, ' ').trim() || `Thread ${id}`;
+    titles.set(id, {
+      id,
+      title,
+      url: `${window.location.origin}/foro/showthread.php?t=${id}`,
+      link
+    });
+  });
+
+  document.querySelectorAll('a[href*="whoposted"]').forEach((link) => {
+    const id = getWhopostedThreadId(link.getAttribute('href'));
+    const count = parseForumCount(link.textContent);
+    if (!id || count === null) return;
+    counters.set(id, count);
+  });
+
+  const poles = [];
+  for (const [id, count] of counters) {
+    if (count !== 0) continue;
+
+    const info = titles.get(id);
+    if (info?.link && isClosedForumDisplayThread(info.link, id)) continue;
+
+    poles.push({
+      id,
+      title: info?.title || `Thread ${id}`,
+      url: info?.url || `${window.location.origin}/foro/showthread.php?t=${id}`
+    });
+  }
+
+  return {
+    poles,
+    stats: {
+      titles: titles.size,
+      counters: counters.size,
+      zeros: poles.length
+    }
+  };
+}
+
+function scanForumDisplayForPoles() {
+  if (!isForumDisplayListPage() || !polileoIsActive || document.visibilityState === 'hidden') return;
+
+  const { poles, stats } = collectForumDisplayPolesFromDOM();
+  const now = Date.now();
+  if (now - lastForumDisplayStatsLog > 5000 || stats.zeros > 0) {
+    console.log('Polileo: forumdisplay DOM scan - titles:', stats.titles, 'counters:', stats.counters, 'zero:', stats.zeros);
+    lastForumDisplayStatsLog = now;
+  }
+
+  const newPoles = poles.filter(pole => !forumDisplayReportedPoleIds.has(pole.id));
+  if (newPoles.length === 0) return;
+
+  safeSendMessage({
+    action: 'forumDisplayPoles',
+    poles: newPoles,
+    stats
+  }, (response) => {
+    if (response?.success) {
+      const acceptedIds = Array.isArray(response.acceptedIds) ? response.acceptedIds : [];
+      acceptedIds.forEach(id => forumDisplayReportedPoleIds.add(String(id)));
+    }
+  });
+}
+
+function updateForumDisplayScanner() {
+  if (!isForumDisplayListPage() || !polileoIsActive || document.visibilityState === 'hidden') {
+    if (forumDisplayScanTimer) {
+      clearInterval(forumDisplayScanTimer);
+      forumDisplayScanTimer = null;
+    }
+    return;
+  }
+
+  scanForumDisplayForPoles();
+  if (!forumDisplayScanTimer) {
+    forumDisplayScanTimer = setInterval(scanForumDisplayForPoles, 500);
+  }
+}
+
+document.addEventListener('visibilitychange', updateForumDisplayScanner);
+
 // Get initial state
 safeSendMessage({ action: 'getStatus' }, (response) => {
   if (response) updateButton(response.isActive);
@@ -610,6 +760,7 @@ function updateButton(isActive) {
   polileoIsActive = isActive;
   btn.className = isActive ? 'active' : 'inactive';
   updateMuteButtonState();
+  updateForumDisplayScanner();
 }
 
 // Load soundOnlyWhenActive setting

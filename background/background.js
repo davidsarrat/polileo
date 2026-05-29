@@ -29,7 +29,13 @@
  *  13. HTML parsing helpers (countPostsInHtml, extractPoleAuthor)
  */
 
-const FOROCOCHES_URL = 'https://www.forocoches.com/foro/forumdisplay.php?f=2';
+const FOROCOCHES_ORIGIN = 'https://forocoches.com';
+const FOROCOCHES_URL = `${FOROCOCHES_ORIGIN}/foro/forumdisplay.php?f=2`;
+const FOROCOCHES_TAB_URLS = ['*://forocoches.com/*', '*://*.forocoches.com/*'];
+const FOROCOCHES_SHOWTHREAD_TAB_URLS = [
+  '*://forocoches.com/foro/showthread.php*',
+  '*://*.forocoches.com/foro/showthread.php*'
+];
 const ALARM_NAME = 'polileo-keepalive';
 const THREAD_WATCH_ALARM = 'polileo-thread-watch';
 const MAX_OPENED_THREADS = 100;
@@ -134,7 +140,7 @@ self.addEventListener('unhandledrejection', (event) => {
 // ============================================
 async function reinjectContentScripts() {
   try {
-    const tabs = await chrome.tabs.query({ url: '*://*.forocoches.com/*' });
+    const tabs = await chrome.tabs.query({ url: FOROCOCHES_TAB_URLS });
     console.log('Polileo BG: [REINJECT] Found', tabs.length, 'forocoches tabs to re-inject');
 
     for (const tab of tabs) {
@@ -366,7 +372,7 @@ async function _openPoleTabAttempt(url, windowId, attempt, poleId) {
   // Uses regex word boundary to avoid substring false positives (e.g., t=123 matching t=1234).
   // Non-blocking: if the query fails, we proceed with tab creation anyway (better duplicate than missed pole).
   try {
-    const allTabs = await chrome.tabs.query({ url: '*://*.forocoches.com/foro/showthread.php*' });
+    const allTabs = await chrome.tabs.query({ url: FOROCOCHES_SHOWTHREAD_TAB_URLS });
     const polePattern = new RegExp('[?&]t=' + poleId + '(?:&|$)');
     const alreadyOpen = allTabs.some(t => t.url && polePattern.test(t.url) && t.url.includes('polileo'));
     if (alreadyOpen) {
@@ -480,6 +486,85 @@ function saveWatchedThreads() {
     data[threadId] = info;
   }
   chrome.storage.local.set({ watchedThreadsData: data });
+}
+
+function normalizeContentPole(pole) {
+  const id = String(pole?.id || '').trim();
+  if (!/^\d+$/.test(id)) return null;
+
+  let url = `${FOROCOCHES_ORIGIN}/foro/showthread.php?t=${id}`;
+  try {
+    const parsedUrl = new URL(pole.url || url, FOROCOCHES_ORIGIN);
+    parsedUrl.protocol = 'https:';
+    parsedUrl.hostname = 'forocoches.com';
+    parsedUrl.pathname = '/foro/showthread.php';
+    parsedUrl.search = `?t=${id}`;
+    url = parsedUrl.href;
+  } catch {
+    // Keep generated URL.
+  }
+
+  return {
+    id,
+    title: String(pole?.title || `Thread ${id}`).replace(/\s+/g, ' ').trim().substring(0, 300),
+    url
+  };
+}
+
+async function openPolesFromContentScan(rawPoles, senderTab) {
+  const windowId = senderTab?.windowId;
+  if (!windowId) return { opened: 0, acceptedIds: [] };
+
+  const state = windowStates.get(windowId);
+  if (!state?.isActive) {
+    console.log('Polileo BG: Content forum scan ignored because window is inactive:', windowId);
+    return { opened: 0, acceptedIds: [] };
+  }
+
+  const poles = (Array.isArray(rawPoles) ? rawPoles : [])
+    .map(normalizeContentPole)
+    .filter(Boolean);
+
+  if (poles.length === 0) return { opened: 0, acceptedIds: [] };
+
+  let titleBlacklist = [];
+  try {
+    const result = await chrome.storage.local.get(['titleBlacklist']);
+    titleBlacklist = result.titleBlacklist || [];
+  } catch {
+    // Storage error, continue without blacklist.
+  }
+
+  let opened = 0;
+  const acceptedIds = [];
+  for (const pole of poles) {
+    acceptedIds.push(pole.id);
+    if (state.openedThreads.has(pole.id)) continue;
+
+    const titleLower = pole.title.toLowerCase();
+    const isBlacklisted = titleBlacklist.some(term =>
+      titleLower.includes(String(term).toLowerCase())
+    );
+
+    if (isBlacklisted) {
+      console.log('Polileo BG: BLACKLISTED from content scan, skipping:', pole.id, pole.title);
+      state.openedThreads.add(pole.id);
+      continue;
+    }
+
+    console.log('Polileo BG: Opening pole from content DOM scan:', pole.id, pole.title);
+    state.openedThreads.add(pole.id);
+    while (state.openedThreads.size > MAX_OPENED_THREADS) {
+      const oldest = state.openedThreads.values().next().value;
+      state.openedThreads.delete(oldest);
+    }
+    playNotificationSound();
+    openPoleTab(pole.url, windowId, pole.id);
+    opened++;
+  }
+
+  if (acceptedIds.length > 0) saveStates();
+  return { opened, acceptedIds };
 }
 
 // Load saved state on startup
@@ -647,6 +732,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     sendResponse({ success: true });
     return true;
+  } else if (msg.action === 'forumDisplayPoles') {
+    const poles = Array.isArray(msg.poles) ? msg.poles : [];
+    const stats = msg.stats || {};
+    console.log(
+      'Polileo BG: Content forum scan report - titles:',
+      stats.titles,
+      'counters:',
+      stats.counters,
+      'poles:',
+      poles.length
+    );
+
+    openPolesFromContentScan(poles, sender.tab).then((result) => {
+      sendResponse({ success: true, ...result });
+    }).catch((e) => {
+      console.log('Polileo BG: Error handling content forum scan:', e.message);
+      sendResponse({ success: false, opened: 0, acceptedIds: [] });
+    });
+    return true;
   } else if (msg.action === 'polileoPageHasPole') {
     // Track that this tab's polileo page already has a pole
     const tabId = sender.tab?.id;
@@ -760,7 +864,7 @@ function stopGuardrailScan() {
 // Non-blocking scan - fires off parallel checks
 async function scanForUnwatchedThreads() {
   try {
-    const tabs = await chrome.tabs.query({ url: '*://*.forocoches.com/*' });
+    const tabs = await chrome.tabs.query({ url: FOROCOCHES_TAB_URLS });
 
     for (const tab of tabs) {
       const threadId = extractThreadIdFromUrl(tab.url);
@@ -794,7 +898,7 @@ async function checkThreadGuardrail(threadId, tabId) {
     const timeoutId = setTimeout(() => controller.abort(), GUARDRAIL_FETCH_TIMEOUT);
 
     const resp = await fetch(
-      `https://www.forocoches.com/foro/showthread.php?t=${threadId}&_=${Date.now()}`,
+      `${FOROCOCHES_ORIGIN}/foro/showthread.php?t=${threadId}&_=${Date.now()}`,
       {
         credentials: 'include',
         cache: 'no-store',
@@ -1000,53 +1104,176 @@ async function poll() {
   }
 }
 
+function decodeHtmlEntities(text) {
+  if (!text) return '';
+
+  return String(text)
+    .replace(/&#x([0-9a-f]+);/gi, (_, value) => {
+      try {
+        return String.fromCodePoint(parseInt(value, 16));
+      } catch {
+        return _;
+      }
+    })
+    .replace(/&#(\d+);/g, (_, value) => {
+      try {
+        return String.fromCodePoint(parseInt(value, 10));
+      } catch {
+        return _;
+      }
+    })
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
+}
+
+function extractAttr(attrs, attrName) {
+  const attr = new RegExp(`\\b${attrName}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, 'i').exec(attrs);
+  return attr ? decodeHtmlEntities(attr[2]).trim() : '';
+}
+
+function stripHtml(html) {
+  return decodeHtmlEntities(String(html || '')
+    .replace(/<script\b[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]*>/g, ' '))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeForumText(text) {
+  const normalized = text.normalize
+    ? text.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    : text;
+  return normalized.toLowerCase().trim();
+}
+
+function extractThreadIdFromHref(href) {
+  if (!href || !/showthread\.php/i.test(href)) return null;
+
+  let match = href.match(/showthread\.php\/(\d+)/i);
+  if (match) return match[1];
+
+  match = href.match(/[?&]t=(\d+)/i);
+  return match ? match[1] : null;
+}
+
+function isLikelyThreadTitle(text) {
+  if (!text || text.length < 3 || /^\d+$/.test(text)) return false;
+
+  const normalized = normalizeForumText(text);
+  return ![
+    'primer mensaje no leido',
+    'ultimo mensaje'
+  ].includes(normalized);
+}
+
+function extractForumThreadTitles(html) {
+  const titles = new Map();
+  let m;
+
+  // Main path: thread title links have a stable thread_title_ID id, but the
+  // visible text may be nested inside spans.
+  const titleLink = /<a\b([^>]*\bid\s*=\s*["']thread_title_(\d+)["'][^>]*)>([\s\S]*?)<\/a>/gi;
+  while ((m = titleLink.exec(html))) {
+    const [, attrs, id, body] = m;
+    const title = stripHtml(body) || extractAttr(attrs, 'title');
+    titles.set(id, title);
+  }
+
+  // Fallback for variants that link directly to showthread without the id.
+  const anchor = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  while ((m = anchor.exec(html))) {
+    const [, attrs, body] = m;
+    const href = extractAttr(attrs, 'href');
+    const id = extractThreadIdFromHref(href);
+    if (!id || titles.has(id)) continue;
+
+    const title = stripHtml(body);
+    if (isLikelyThreadTitle(title)) {
+      titles.set(id, title);
+    }
+  }
+
+  return titles;
+}
+
+function extractWhopostedCounts(html) {
+  const counts = new Map();
+  let m;
+
+  const anchor = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  while ((m = anchor.exec(html))) {
+    const [, attrs, body] = m;
+    const href = extractAttr(attrs, 'href');
+    if (!/whoposted/i.test(href)) continue;
+
+    const idMatch = href.match(/[?&]t=(\d+)/i);
+    if (!idMatch) continue;
+
+    const countText = stripHtml(body).replace(/[^\d]/g, '');
+    if (countText === '') continue;
+
+    counts.set(idMatch[1], Number(countText));
+  }
+
+  return counts;
+}
+
+function isClosedForumThread(html, id) {
+  const titlePos = html.indexOf(`thread_title_${id}`);
+  const idPos = titlePos !== -1 ? titlePos : html.indexOf(`t=${id}`);
+  if (idPos === -1) return false;
+
+  const windowStart = Math.max(0, idPos - 2000);
+  const windowBefore = html.substring(windowStart, idPos);
+  const lastClosedPos = windowBefore.lastIndexOf('tema-closed');
+  if (lastClosedPos === -1) return false;
+
+  const betweenClosedAndThread = windowBefore.substring(lastClosedPos);
+  return !betweenClosedAndThread.includes('thread_title_');
+}
+
 function findPoles(html) {
   const poles = [];
   const seen = new Set();
-  const titles = new Map();
+  const titles = extractForumThreadTitles(html);
+  const replyCounts = extractWhopostedCounts(html);
+  const zeroReplyIds = [...replyCounts.entries()]
+    .filter(([, count]) => count === 0)
+    .map(([id]) => id);
 
-  let m;
+  console.log(
+    'Polileo BG: findPoles - found',
+    titles.size,
+    'thread titles and',
+    replyCounts.size,
+    'reply counters (zero:',
+    zeroReplyIds.length + ')'
+  );
 
-  // Step 1: Extract thread titles
-  const t1 = /thread_title_(\d+)[^>]*>([^<]+)</gi;
-  while ((m = t1.exec(html))) titles.set(m[1], m[2].trim());
+  for (const [id, count] of replyCounts) {
+    if (count !== 0 || seen.has(id)) continue;
 
-  const t2 = /showthread\.php\?t=(\d+)[^>]*>([^<]{3,})</gi;
-  while ((m = t2.exec(html))) if (!titles.has(m[1])) titles.set(m[1], m[2].trim());
-
-  console.log('Polileo BG: findPoles - found', titles.size, 'thread titles');
-
-  // Step 2: Find threads with 0 replies (whoposted shows 0)
-  const r = /whoposted[^"]*t=(\d+)[^>]*>(\d+)</gi;
-  while ((m = r.exec(html))) {
-    const [, id, count] = m;
-    if (count === '0' && titles.has(id) && !seen.has(id)) {
-      // Check if this thread is closed by looking for tema-closed near the thread_title
-      // Search in a window of 2000 chars before thread_title_ID for tema-closed
-      const titlePos = html.indexOf(`thread_title_${id}`);
-      if (titlePos !== -1) {
-        const windowStart = Math.max(0, titlePos - 2000);
-        const windowBefore = html.substring(windowStart, titlePos);
-
-        // Check if tema-closed appears in the window AND there's no other thread_title between them
-        const lastClosedPos = windowBefore.lastIndexOf('tema-closed');
-        if (lastClosedPos !== -1) {
-          // Make sure no other thread_title appears between the closed icon and our thread
-          const betweenClosedAndTitle = windowBefore.substring(lastClosedPos);
-          if (!betweenClosedAndTitle.includes('thread_title_')) {
-            console.log('Polileo BG: Skipping CLOSED thread:', id, titles.get(id));
-            continue;
-          }
-        }
-      }
-
-      seen.add(id);
-      poles.push({
-        id,
-        title: titles.get(id),
-        url: `https://www.forocoches.com/foro/showthread.php?t=${id}`
-      });
+    const title = titles.get(id) || `Thread ${id}`;
+    if (isClosedForumThread(html, id)) {
+      console.log('Polileo BG: Skipping CLOSED thread:', id, title);
+      continue;
     }
+
+    seen.add(id);
+    poles.push({
+      id,
+      title,
+      url: `${FOROCOCHES_ORIGIN}/foro/showthread.php?t=${id}`
+    });
+  }
+
+  if (zeroReplyIds.length > 0 && poles.length === 0) {
+    console.log('Polileo BG: findPoles - zero-reply IDs skipped:', zeroReplyIds.slice(0, 10).join(', '));
   }
 
   console.log('Polileo BG: findPoles - returning', poles.length, 'poles');
@@ -1279,7 +1506,7 @@ async function checkSingleThread(threadId, info) {
 
   try {
     const resp = await fetch(
-      `https://www.forocoches.com/foro/showthread.php?t=${threadId}&_=${Date.now()}`,
+      `${FOROCOCHES_ORIGIN}/foro/showthread.php?t=${threadId}&_=${Date.now()}`,
       {
         credentials: 'include',
         cache: 'no-store',
