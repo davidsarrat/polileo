@@ -1022,6 +1022,10 @@ async function poll() {
     return;
   }
 
+  // Mark when this cycle began so the next poll fires on a fixed cadence
+  // (POLL_INTERVAL from start) instead of POLL_INTERVAL *after* the fetch +
+  // parse + tab-open work, which inflated the real interval every cycle.
+  const pollStart = Date.now();
   let pollTimeoutId;
   try {
     const pollController = new AbortController();
@@ -1095,9 +1099,13 @@ async function poll() {
     console.log('Polileo BG: Error during poll:', e.message);
   } finally {
     _polling = false;
-    // ALWAYS schedule next poll if there are active windows (even after errors)
+    // ALWAYS schedule next poll if there are active windows (even after errors).
+    // Subtract the time this cycle already consumed so the cadence stays a true
+    // fixed POLL_INTERVAL period rather than POLL_INTERVAL + fetch + parse time.
+    // The _polling guard still prevents overlapping fetches.
     if ([...windowStates.values()].some(s => s.isActive)) {
-      pollTimer = setTimeout(poll, POLL_INTERVAL);
+      const nextDelay = Math.max(0, POLL_INTERVAL - (Date.now() - pollStart));
+      pollTimer = setTimeout(poll, nextDelay);
     } else {
       pollTimer = null;
     }
